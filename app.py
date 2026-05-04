@@ -107,6 +107,23 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ─── Pending state apply ───────────────────────────────────────
+# Reset / upload handlers run AFTER the sliders are rendered, so they can't
+# write to widget-bound session_state keys directly (Streamlit forbids it).
+# Instead they stash a config under "_pending_weights" + call st.rerun().
+# On the next run we apply it here, before any widget is instantiated.
+_pending = st.session_state.pop("_pending_weights", None)
+if _pending:
+    for k in (
+        "m", "global_avg", "lam_s", "lam_d", "offset_km", "scale_km",
+        "aff_floor", "decay_floor", "default_affinity", "candidate_size",
+    ):
+        if k in _pending:
+            st.session_state[k] = _pending[k]
+    if "current_affinities" in _pending:
+        st.session_state["current_affinities"] = _pending["current_affinities"]
+    st.session_state["aff_version"] = st.session_state.get("aff_version", 0) + 1
+
 # ─── Sidebar: Inputs + Config ──────────────────────────────────
 with st.sidebar:
     tcol, _ = st.columns([1, 1])
@@ -470,14 +487,19 @@ with st.sidebar:
             try:
                 if os.path.exists(DEFAULTS_FILE):
                     os.remove(DEFAULTS_FILE)
-                for k in ("m", "global_avg", "default_affinity",
-                          "aff_floor", "decay_floor", "offset_km", "scale_km",
-                          "candidate_size"):
-                    st.session_state[k] = FACTORY_DEFAULTS[k]
-                st.session_state["lam_s"] = FACTORY_DEFAULTS["lambda_s"]
-                st.session_state["lam_d"] = FACTORY_DEFAULTS["lambda_d"]
-                st.session_state["current_affinities"] = copy.deepcopy(FACTORY_DEFAULTS["affinities"])
-                st.session_state["aff_version"] += 1
+                st.session_state["_pending_weights"] = {
+                    "m": FACTORY_DEFAULTS["m"],
+                    "global_avg": FACTORY_DEFAULTS["global_avg"],
+                    "lam_s": FACTORY_DEFAULTS["lambda_s"],
+                    "lam_d": FACTORY_DEFAULTS["lambda_d"],
+                    "offset_km": FACTORY_DEFAULTS["offset_km"],
+                    "scale_km": FACTORY_DEFAULTS["scale_km"],
+                    "aff_floor": FACTORY_DEFAULTS["aff_floor"],
+                    "decay_floor": FACTORY_DEFAULTS["decay_floor"],
+                    "default_affinity": FACTORY_DEFAULTS["default_affinity"],
+                    "candidate_size": FACTORY_DEFAULTS["candidate_size"],
+                    "current_affinities": copy.deepcopy(FACTORY_DEFAULTS["affinities"]),
+                }
                 st.session_state.pop("last_loaded_sig", None)
                 st.toast("Reset to factory defaults", icon="↩️")
                 st.rerun()
@@ -522,16 +544,6 @@ with st.sidebar:
                     # Back-compat: legacy "lambda" → lambda_s.
                     if "lambda" in cfg and "lambda_s" not in cfg:
                         cfg["lambda_s"] = cfg["lambda"]
-                    st.session_state["m"] = int(cfg.get("m", FACTORY_DEFAULTS["m"]))
-                    st.session_state["global_avg"] = float(cfg.get("global_avg", FACTORY_DEFAULTS["global_avg"]))
-                    st.session_state["lam_s"] = float(cfg.get("lambda_s", FACTORY_DEFAULTS["lambda_s"]))
-                    st.session_state["lam_d"] = float(cfg.get("lambda_d", FACTORY_DEFAULTS["lambda_d"]))
-                    st.session_state["offset_km"] = float(cfg.get("offset_km", FACTORY_DEFAULTS["offset_km"]))
-                    st.session_state["scale_km"] = float(cfg.get("scale_km", FACTORY_DEFAULTS["scale_km"]))
-                    st.session_state["aff_floor"] = float(cfg.get("aff_floor", FACTORY_DEFAULTS["aff_floor"]))
-                    st.session_state["decay_floor"] = float(cfg.get("decay_floor", FACTORY_DEFAULTS["decay_floor"]))
-                    st.session_state["default_affinity"] = float(cfg.get("default_affinity", FACTORY_DEFAULTS["default_affinity"]))
-                    st.session_state["candidate_size"] = int(cfg.get("candidate_size", FACTORY_DEFAULTS["candidate_size"]))
 
                     # Per-context affinity (mixed shape) with back-compat for legacy "affinity".
                     new_affs = copy.deepcopy(FACTORY_AFFINITIES)
@@ -546,11 +558,22 @@ with st.sidebar:
                         legacy = _coerce_matrix(cfg["affinity"])
                         if legacy:
                             new_affs["Hotel"] = legacy
-                    st.session_state["current_affinities"] = new_affs
 
-                    st.session_state["aff_version"] += 1
+                    st.session_state["_pending_weights"] = {
+                        "m": int(cfg.get("m", FACTORY_DEFAULTS["m"])),
+                        "global_avg": float(cfg.get("global_avg", FACTORY_DEFAULTS["global_avg"])),
+                        "lam_s": float(cfg.get("lambda_s", FACTORY_DEFAULTS["lambda_s"])),
+                        "lam_d": float(cfg.get("lambda_d", FACTORY_DEFAULTS["lambda_d"])),
+                        "offset_km": float(cfg.get("offset_km", FACTORY_DEFAULTS["offset_km"])),
+                        "scale_km": float(cfg.get("scale_km", FACTORY_DEFAULTS["scale_km"])),
+                        "aff_floor": float(cfg.get("aff_floor", FACTORY_DEFAULTS["aff_floor"])),
+                        "decay_floor": float(cfg.get("decay_floor", FACTORY_DEFAULTS["decay_floor"])),
+                        "default_affinity": float(cfg.get("default_affinity", FACTORY_DEFAULTS["default_affinity"])),
+                        "candidate_size": int(cfg.get("candidate_size", FACTORY_DEFAULTS["candidate_size"])),
+                        "current_affinities": new_affs,
+                    }
                     st.session_state["last_loaded_sig"] = sig
-                    st.success(f"Loaded weights from {uploaded.name}")
+                    st.toast(f"Loaded weights from {uploaded.name}", icon="✅")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to load: {e}")
