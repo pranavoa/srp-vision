@@ -61,6 +61,7 @@ from srp_simulator.scoring import (
     active_context,
     apply_sort,
     score_row,
+    score_row_popularity,
 )
 from srp_simulator.auth import require_auth
 from srp_simulator.theme import inject_theme
@@ -115,6 +116,7 @@ st.markdown(
 _pending = st.session_state.pop("_pending_weights", None)
 if _pending:
     for k in (
+        "variant",
         "m", "global_avg", "lam_s", "lam_d", "offset_km", "scale_km",
         "aff_floor", "decay_floor", "default_affinity", "candidate_size",
     ):
@@ -124,10 +126,32 @@ if _pending:
         st.session_state["current_affinities"] = _pending["current_affinities"]
     st.session_state["aff_version"] = st.session_state.get("aff_version", 0) + 1
 
+# Variant labels — kept in one place so the toggle, dispatch, and save/load
+# all reference the same strings.
+VARIANT_PHASE1 = "Phase 1 — Bayesian + Distance Decay"
+VARIANT_POPULARITY = "Popularity v1.2.0 — userAvg × log1p(reviews) × affinity^λ"
+VARIANT_KEY = {VARIANT_PHASE1: "phase1", VARIANT_POPULARITY: "popularity"}
+
 # ─── Sidebar: Inputs + Config ──────────────────────────────────
 with st.sidebar:
     tcol, _ = st.columns([1, 1])
     tcol.toggle("Dark mode", key="theme_toggle")
+
+    st.markdown("## Scoring formula")
+    variant = st.radio(
+        "Recommended scoring variant",
+        [VARIANT_PHASE1, VARIANT_POPULARITY],
+        key="variant",
+        label_visibility="collapsed",
+        help=(
+            "Phase 1: Bayesian rating × affinity^λ_s × distance-decay^λ_d "
+            "(planned future state).\n"
+            "Popularity v1.2.0: userAvgRating × log1p(reviews) × affinity^λ "
+            "— matches the production ON-6566 implementation."
+        ),
+    )
+    is_phase1 = variant == VARIANT_PHASE1
+    st.divider()
 
     st.markdown("## Search Input")
     search_type = st.radio(
@@ -338,14 +362,25 @@ with st.sidebar:
     if "aff_version" not in st.session_state:
         st.session_state["aff_version"] = 0
 
-    with st.expander("Bayesian dampening", expanded=True):
-        m = st.slider("m (prior weight)", 0, 200, ACTIVE_DEFAULTS["m"], 5, key="m",
-                      help="At n=m reviews, hotel and prior weigh equally. Higher m = more skeptical of low-review hotels.")
-        global_avg = st.slider("global_avg (platform mean)", 1.0, 5.0, ACTIVE_DEFAULTS["global_avg"], 0.05, key="global_avg")
+    if is_phase1:
+        with st.expander("Bayesian dampening", expanded=True):
+            m = st.slider("m (prior weight)", 0, 200, ACTIVE_DEFAULTS["m"], 5, key="m",
+                          help="At n=m reviews, hotel and prior weigh equally. Higher m = more skeptical of low-review hotels.")
+            global_avg = st.slider("global_avg (platform mean)", 1.0, 5.0, ACTIVE_DEFAULTS["global_avg"], 0.05, key="global_avg")
+    else:
+        # Bayesian knobs are unused in Popularity variant — keep state alive
+        # so toggling back to Phase 1 restores the user's last values.
+        m = int(st.session_state.get("m", ACTIVE_DEFAULTS["m"]))
+        global_avg = float(st.session_state.get("global_avg", ACTIVE_DEFAULTS["global_avg"]))
 
     with st.expander("Star affinity matrices (per search context)", expanded=False):
-        lam_s = st.slider("λ_s (star strength)", 0.0, 3.0, ACTIVE_DEFAULTS["lambda_s"], 0.1, key="lam_s",
-                          help="0 = ignore stars  •  1 = default  •  2 = strict tier match")
+        lam_label = "λ_s (star strength)" if is_phase1 else "λ (star multiplier exponent)"
+        lam_help = (
+            "0 = ignore stars  •  1 = default  •  2 = strict tier match"
+            if is_phase1
+            else "Production default = 1.0. 0 disables the multiplier; 2 makes tier match strict."
+        )
+        lam_s = st.slider(lam_label, 0.0, 3.0, ACTIVE_DEFAULTS["lambda_s"], 0.1, key="lam_s", help=lam_help)
 
         active_ctx = active_context(search_type, params)
         st.caption(
@@ -422,30 +457,45 @@ with st.sidebar:
             min_value=0.0, max_value=1.0, step=0.05,
             key="default_affinity",
         )
-        aff_floor = st.slider(
-            "aff_floor (min star factor)", 0.0, 0.5,
-            ACTIVE_DEFAULTS["aff_floor"], 0.05, key="aff_floor",
-            help="Floor on affinity^λ_s so a single bad-tier match can't fully zero out a hotel.",
-        )
+        if is_phase1:
+            aff_floor = st.slider(
+                "aff_floor (min star factor)", 0.0, 0.5,
+                ACTIVE_DEFAULTS["aff_floor"], 0.05, key="aff_floor",
+                help="Floor on affinity^λ_s so a single bad-tier match can't fully zero out a hotel.",
+            )
+        else:
+            # No floor in the Popularity formula — production matches the matrix exactly.
+            aff_floor = float(st.session_state.get("aff_floor", ACTIVE_DEFAULTS["aff_floor"]))
 
-    with st.expander("Distance decay", expanded=False):
-        lam_d = st.slider("λ_d (distance strength)", 0.0, 3.0,
-                          ACTIVE_DEFAULTS["lambda_d"], 0.1, key="lam_d",
-                          help="0 = ignore distance  •  1 = default  •  2 = distance dominates")
-        offset_km = st.slider("offset_km (free zone)", 0.0, 5.0,
-                              ACTIVE_DEFAULTS["offset_km"], 0.1, key="offset_km",
-                              help="Within this radius, distance doesn't penalize at all.")
-        scale_km = st.slider("scale_km (decay = 0.5 at offset+scale)", 0.5, 30.0,
-                             ACTIVE_DEFAULTS["scale_km"], 0.5, key="scale_km",
-                             help="Tighter scale = stricter proximity. Past 3× scale, decay ≈ 0.")
-        decay_floor = st.slider(
-            "decay_floor (min distance factor)", 0.0, 0.5,
-            ACTIVE_DEFAULTS["decay_floor"], 0.05, key="decay_floor",
-            help="Floor on decay^λ_d so far-away-but-otherwise-great hotels still surface.",
-        )
+    if is_phase1:
+        with st.expander("Distance decay", expanded=False):
+            lam_d = st.slider("λ_d (distance strength)", 0.0, 3.0,
+                              ACTIVE_DEFAULTS["lambda_d"], 0.1, key="lam_d",
+                              help="0 = ignore distance  •  1 = default  •  2 = distance dominates")
+            offset_km = st.slider("offset_km (free zone)", 0.0, 5.0,
+                                  ACTIVE_DEFAULTS["offset_km"], 0.1, key="offset_km",
+                                  help="Within this radius, distance doesn't penalize at all.")
+            scale_km = st.slider("scale_km (decay = 0.5 at offset+scale)", 0.5, 30.0,
+                                 ACTIVE_DEFAULTS["scale_km"], 0.5, key="scale_km",
+                                 help="Tighter scale = stricter proximity. Past 3× scale, decay ≈ 0.")
+            decay_floor = st.slider(
+                "decay_floor (min distance factor)", 0.0, 0.5,
+                ACTIVE_DEFAULTS["decay_floor"], 0.05, key="decay_floor",
+                help="Floor on decay^λ_d so far-away-but-otherwise-great hotels still surface.",
+            )
+            st.caption(
+                "Decay only applies when there's an anchor (Hotel/Landmark, or City/Area "
+                "with optional geo center). State / Country searches skip this term."
+            )
+    else:
+        # Popularity variant has no distance term — preserve user values for toggle-back.
+        lam_d = float(st.session_state.get("lam_d", ACTIVE_DEFAULTS["lambda_d"]))
+        offset_km = float(st.session_state.get("offset_km", ACTIVE_DEFAULTS["offset_km"]))
+        scale_km = float(st.session_state.get("scale_km", ACTIVE_DEFAULTS["scale_km"]))
+        decay_floor = float(st.session_state.get("decay_floor", ACTIVE_DEFAULTS["decay_floor"]))
         st.caption(
-            "Decay only applies when there's an anchor (Hotel/Landmark, or City/Area "
-            "with optional geo center). State / Country searches skip this term."
+            "ℹ️  Popularity variant has no distance-decay term. Distance is shown for context "
+            "but never enters the score (matches production behavior — see ON-6566)."
         )
 
     with st.expander("Fetch settings", expanded=False):
@@ -458,6 +508,7 @@ with st.sidebar:
     # ─── Save / load weights profile ──────────────────────────
     with st.expander("💾 Save / load weights", expanded=False):
         current_config = {
+            "variant": VARIANT_KEY[variant],
             "m": int(m),
             "global_avg": float(global_avg),
             "lambda_s": float(lam_s),
@@ -488,6 +539,7 @@ with st.sidebar:
                 if os.path.exists(DEFAULTS_FILE):
                     os.remove(DEFAULTS_FILE)
                 st.session_state["_pending_weights"] = {
+                    "variant": VARIANT_PHASE1,
                     "m": FACTORY_DEFAULTS["m"],
                     "global_avg": FACTORY_DEFAULTS["global_avg"],
                     "lam_s": FACTORY_DEFAULTS["lambda_s"],
@@ -559,7 +611,15 @@ with st.sidebar:
                         if legacy:
                             new_affs["Hotel"] = legacy
 
+                    # Variant resolution: explicit key wins; legacy files (no variant)
+                    # default to phase1 to preserve prior behaviour.
+                    cfg_variant = cfg.get("variant", "phase1")
+                    pending_variant = (
+                        VARIANT_POPULARITY if cfg_variant == "popularity" else VARIANT_PHASE1
+                    )
+
                     st.session_state["_pending_weights"] = {
+                        "variant": pending_variant,
                         "m": int(cfg.get("m", FACTORY_DEFAULTS["m"])),
                         "global_avg": float(cfg.get("global_avg", FACTORY_DEFAULTS["global_avg"])),
                         "lam_s": float(cfg.get("lambda_s", FACTORY_DEFAULTS["lambda_s"])),
@@ -589,9 +649,14 @@ k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Candidates", f"{len(candidates):,}" if candidates else "—")
 k2.metric("Total in ES", f"{last_total:,}" if last_total else "—")
 k3.metric("Selected ★", params.get("selected_star") or "—")
-k4.metric("λ_s · λ_d", f"{lam_s:.1f} · {lam_d:.1f}")
-k5.metric("scale_km", f"{scale_km:.1f}")
-k6.metric("Bayesian m", f"{m}")
+if is_phase1:
+    k4.metric("λ_s · λ_d", f"{lam_s:.1f} · {lam_d:.1f}")
+    k5.metric("scale_km", f"{scale_km:.1f}")
+    k6.metric("Bayesian m", f"{m}")
+else:
+    k4.metric("λ", f"{lam_s:.1f}")
+    k5.metric("Variant", "Popularity")
+    k6.metric("Formula", "rating × log1p(rev) × aff^λ")
 
 # ─── Action bar: Search button + Sort selector ────────────────
 ac1, ac2 = st.columns([1.4, 4])
@@ -678,18 +743,33 @@ if candidates:
         "default_affinity": default_affinity,
         "anchor": st.session_state.get("last_anchor"),
     }
-    scored = [score_row(r, scoring) for r in candidates]
+    scorer = score_row if is_phase1 else score_row_popularity
+    scored = [scorer(r, scoring) for r in candidates]
     ranked = apply_sort(
         scored, sort_type,
         anchor_hotel_code=st.session_state.get("last_anchor_hotelCode"),
     )
 
     df = pd.DataFrame(ranked)
-    show_cols = [
-        "hotelCode", "hotelName", "propertyType", "cityName", "hotelRating", "userAvgRating",
-        "hotelTotalReviews", "adj_rating", "affinity", "decay",
-        "distance_km", "final_score", "address",
-    ]
+    if is_phase1:
+        show_cols = [
+            "hotelCode", "hotelName", "propertyType", "cityName", "hotelRating", "userAvgRating",
+            "hotelTotalReviews", "adj_rating", "affinity", "decay",
+            "distance_km", "final_score", "address",
+        ]
+        score_max = 5.0
+        adj_col_label = "Adj. Rating"
+    else:
+        # Popularity variant: hide adj_rating + decay (not in formula); show popularity instead.
+        show_cols = [
+            "hotelCode", "hotelName", "propertyType", "cityName", "hotelRating", "userAvgRating",
+            "hotelTotalReviews", "popularity", "affinity",
+            "distance_km", "final_score", "address",
+        ]
+        # log1p(reviews) caps the score range; pad 5 % so the bar isn't pinned at 100 %.
+        score_max = max(1.0, float(df["final_score"].max()) * 1.05) if "final_score" in df else 60.0
+        adj_col_label = "Adj. Rating"  # unused in popularity layout
+
     show_cols = [c for c in show_cols if c in df.columns]
     df = df[show_cols].copy()
     df.index = range(1, len(df) + 1)
@@ -710,12 +790,16 @@ if candidates:
             "userAvgRating":     st.column_config.NumberColumn("User ★", format="%.2f"),
             "hotelTotalReviews": st.column_config.NumberColumn("Reviews", format="%d"),
             "adj_rating":        st.column_config.ProgressColumn(
-                "Adj. Rating", min_value=1.0, max_value=5.0, format="%.3f",
+                adj_col_label, min_value=1.0, max_value=5.0, format="%.3f",
+            ),
+            "popularity":        st.column_config.NumberColumn(
+                "log1p(reviews)", format="%.2f",
+                help="Logarithmic popularity factor — multiplies the score in the v1.2.0 formula.",
             ),
             "affinity":          st.column_config.NumberColumn("Affinity", format="%.2f"),
             "decay":             st.column_config.NumberColumn("Decay", format="%.2f"),
             "final_score":       st.column_config.ProgressColumn(
-                "Final Score", min_value=0.0, max_value=5.0, format="%.3f",
+                "Final Score", min_value=0.0, max_value=score_max, format="%.3f",
             ),
             "distance_km":       st.column_config.NumberColumn("Dist (km)", format="%.2f"),
             "address":           st.column_config.TextColumn("Address", width="medium"),
@@ -725,12 +809,18 @@ if candidates:
     cap_l, cap_r = st.columns([4, 1])
     has_anchor = bool(scoring.get("anchor") and scoring["anchor"].get("lat") is not None)
     sel_repr = f"**{scoring['selected_star']}**" if scoring.get("selected_star") else "—"
+    if is_phase1:
+        knob_summary = (
+            f"λ_s {lam_s} · λ_d {lam_d if has_anchor else '—'} · "
+            f"scale {scale_km}km · offset {offset_km}km · "
+            f"m {m} · global_avg {global_avg}"
+        )
+    else:
+        knob_summary = f"variant **Popularity v1.2.0** · λ {lam_s}"
     cap_l.caption(
         f"Sort: **{sort_type}** · Context **{scoring.get('context', '—')}** · "
         f"Selected ★ {sel_repr} · "
-        f"λ_s {lam_s} · λ_d {lam_d if has_anchor else '—'} · "
-        f"scale {scale_km}km · offset {offset_km}km · "
-        f"m {m} · global_avg {global_avg} · "
+        f"{knob_summary} · "
         f"showing top {top_n} of {len(df):,}"
     )
     if len(df) > top_n:

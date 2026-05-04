@@ -1,15 +1,25 @@
-"""Pure scoring logic — Bayesian rating, affinity lookup, distance decay, sort.
+"""Pure scoring logic — two formula variants, affinity lookup, sort.
 
 Stays import-free of Streamlit so it's trivially testable.
 
-Formula:
+Variants:
+    "phase1"      — Bayesian rating × affinity^λ_s × decay^λ_d (deferred future state)
+    "popularity"  — userAvgRating × log1p(reviews) × affinity^λ  (currently shipping in
+                    ON-6566 v1.2.0; see docs/changedoc.md)
+
+Phase 1 formula:
     final = adjusted_rating
             × max(aff_floor,   affinity[selected_★][hotel_★] ^ λ_s)
             × max(decay_floor, distance_decay(d, anchor)     ^ λ_d)
 
     distance_decay = exp( -max(0, d − offset_km)² / (2 × scale_km²) )
 
-Conditional behaviour:
+Popularity formula:
+    final = max(1.0, userAvgRating)
+            × log1p(max(1.0, hotelTotalReviews))
+            × affinity[selected_★][hotel_★] ^ λ
+
+Conditional behaviour (phase1):
     - distance term skipped when no anchor
     - star term skipped when context has no selected_star (flat contexts)
 """
@@ -124,6 +134,61 @@ def score_row(row: dict, scoring: dict) -> dict:
         "adj_rating": adj,
         "affinity": a,
         "decay": decay,
+        "final_score": final,
+        "distance_km": dist,
+    }
+
+
+def score_row_popularity(row: dict, scoring: dict) -> dict:
+    """Apply the production v1.2.0 formula (ON-6566) to a single hotel row.
+
+        final = userAvgRating × log1p(hotelTotalReviews) × affinity^λ
+
+    Mirrors the Elasticsearch ``function_score`` exactly:
+      - missing ``userAvgRating``     → 1.0  (per ``MISSING_USER_RATING``)
+      - missing ``hotelTotalReviews`` → 1.0  (per ``MISSING_HOTEL_TOTAL_REVIEWS``)
+      - bucket weight = ``affinity[selected_★][hotel_★] ^ λ`` (no floor)
+    """
+    rating = row.get("userAvgRating")
+    rating = 1.0 if rating is None else float(rating)
+
+    reviews = row.get("hotelTotalReviews")
+    reviews = 1.0 if reviews is None else float(reviews)
+    pop = math.log1p(reviews)
+
+    ctx = scoring.get("context") or "Hotel"
+    weights = scoring["affinities"].get(ctx)
+    hotel_star = row.get("hotelRating")
+    if hotel_star is None:
+        a = scoring["default_affinity"]
+    elif is_flat_context(ctx):
+        a = (weights or FACTORY_FLAT_WEIGHTS).get(hotel_star, scoring["default_affinity"])
+    else:
+        sel = scoring.get("selected_star")
+        if sel is None:
+            a = scoring["default_affinity"]
+        else:
+            a = affinity_lookup(
+                weights or FACTORY_AFFINITY_MATRIX,
+                sel, hotel_star, scoring["default_affinity"],
+            )
+    bucket_weight = a ** scoring["lambda_s"]
+
+    final = rating * pop * bucket_weight
+
+    # Distance kept for display only — never enters the popularity score.
+    dist: float | None = None
+    anchor = scoring.get("anchor")
+    if (anchor and anchor.get("lat") is not None
+            and row.get("lat") is not None and row.get("lon") is not None):
+        dist = haversine_km((anchor["lat"], anchor["lon"]), (row["lat"], row["lon"]))
+
+    return {
+        **row,
+        "adj_rating": rating,           # raw rating in this variant (for sort compat)
+        "popularity": pop,
+        "affinity": a,
+        "decay": 1.0,
         "final_score": final,
         "distance_km": dist,
     }
