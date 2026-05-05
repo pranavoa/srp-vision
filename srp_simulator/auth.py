@@ -34,7 +34,10 @@ def require_auth(allowed_domain: str) -> None:
         st.title("Mirador")
         st.caption(f"Sign in with your @{allowed_domain} Google account to continue.")
         if st.button("Sign in with Google", type="primary"):
-            st.login("google")
+            # Uses the default provider in [auth] secrets. To support multiple
+            # providers, namespace them as [auth.google], [auth.microsoft] and
+            # call st.login("google") instead.
+            st.login()
         st.stop()
 
     email = (st.user.email or "").lower()
