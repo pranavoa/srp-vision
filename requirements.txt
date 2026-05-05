@@ -1,4 +1,6 @@
 streamlit>=1.42
 requests>=2.31
 pandas>=2.0
-Authlib>=1.3.2
+# Pinned to 1.3.x: newer Authlib (1.4+) breaks Streamlit's OIDC auth
+# (500 on /~/+/auth/login). Bump only after testing on staging.
+Authlib>=1.3.2,<1.4
