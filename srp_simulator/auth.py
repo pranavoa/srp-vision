@@ -33,11 +33,39 @@ def require_auth(allowed_domain: str) -> None:
     if not st.user.is_logged_in:
         st.title("Mirador")
         st.caption(f"Sign in with your @{allowed_domain} Google account to continue.")
+
+        # ─── Diagnostic: shows secret-key shape (no values) ─────
+        # TEMP — remove once auth is verified working in production.
+        with st.expander("🔧 Auth config check (debug)", expanded=True):
+            try:
+                cfg = dict(st.secrets.get("auth", {}))
+                shape = {
+                    k: (
+                        f"str(len={len(v)})"
+                        if isinstance(v, str)
+                        else f"dict(keys={sorted(v.keys())})"
+                        if isinstance(v, dict)
+                        else type(v).__name__
+                    )
+                    for k, v in cfg.items()
+                }
+                st.write({"keys_present": sorted(cfg.keys()), "shapes": shape})
+                expected = {"client_id", "client_secret", "redirect_uri",
+                            "cookie_secret", "server_metadata_url"}
+                missing = expected - set(cfg.keys())
+                if missing:
+                    st.error(f"Missing required keys: {sorted(missing)}")
+            except Exception as e:
+                st.error(f"Secrets read error — {type(e).__name__}: {e}")
+
         if st.button("Sign in with Google", type="primary"):
-            # Uses the default provider in [auth] secrets. To support multiple
-            # providers, namespace them as [auth.google], [auth.microsoft] and
-            # call st.login("google") instead.
-            st.login()
+            try:
+                # Uses the default provider in [auth] secrets. To support multiple
+                # providers, namespace them as [auth.google] and call
+                # st.login("google") instead.
+                st.login()
+            except Exception as e:
+                st.error(f"Sign-in failed — {type(e).__name__}: {e}")
         st.stop()
 
     email = (st.user.email or "").lower()
